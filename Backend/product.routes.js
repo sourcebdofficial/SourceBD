@@ -4,6 +4,7 @@ const router = express.Router();
 
 const Product = require("./product.model");
 const Review = require("./review.model");
+const User = require("./user.model");
 
 // ========================================
 // GET ALL PUBLISHED PRODUCTS
@@ -90,7 +91,7 @@ router.get("/", async (req, res) => {
         .select(
           "name description category price currency quantity unit minimumOrderQuantity supplier images createdAt"
         )
-        .populate("supplier", "name isVerified businessName city address verificationStatus")
+        .populate("supplier", "name email phone isVerified businessName businessType businessDescription city address verificationStatus")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limitNumber)
@@ -128,6 +129,67 @@ router.get("/", async (req, res) => {
   }
 });
 
+// GET DISTINCT CATEGORIES USED BY PUBLISHED PRODUCTS
+router.get("/categories", async (req, res) => {
+  try {
+    const categories = await Product.aggregate([
+      { $match: { status: "published" } },
+      { $group: { _id: "$category", productCount: { $sum: 1 } } },
+      { $sort: { _id: 1 } },
+    ]);
+    return res.status(200).json({
+      categories: categories.map(({ _id, productCount }) => ({ name: _id, productCount })),
+    });
+  } catch (error) {
+    console.error("Get product categories error:", error);
+    return res.status(500).json({ message: "Failed to fetch product categories." });
+  }
+});
+
+// Public supplier directory: only suppliers with published products are listed.
+router.get("/suppliers", async (req, res) => {
+  try {
+    const supplierStats = await Product.aggregate([
+      { $match: { status: "published" } },
+      { $group: { _id: "$supplier", productCount: { $sum: 1 }, latestListing: { $max: "$createdAt" } } },
+      { $sort: { latestListing: -1 } },
+      { $limit: 100 },
+    ]);
+    const ids = supplierStats.map((item) => item._id);
+    const suppliers = await User.find({ _id: { $in: ids }, role: "supplier", isActive: true })
+      .select("name email phone businessName businessType businessDescription address city isVerified verificationStatus")
+      .lean();
+    const suppliersById = new Map(suppliers.map((supplier) => [String(supplier._id), supplier]));
+    return res.json({
+      suppliers: supplierStats.map((item) => ({ ...suppliersById.get(String(item._id)), productCount: item.productCount, latestListing: item.latestListing })).filter((supplier) => supplier._id),
+    });
+  } catch (error) {
+    console.error("Public supplier directory error:", error);
+    return res.status(500).json({ message: "Failed to fetch suppliers." });
+  }
+});
+
+// Public supplier profile and that supplier's published products.
+router.get("/suppliers/:id", async (req, res) => {
+  try {
+    if (!/^[a-fA-F0-9]{24}$/.test(req.params.id)) return res.status(400).json({ message: "Invalid supplier ID." });
+    const [supplier, products] = await Promise.all([
+      User.findOne({ _id: req.params.id, role: "supplier", isActive: true })
+        .select("name email phone businessName businessType businessDescription address city isVerified verificationStatus createdAt")
+        .lean(),
+      Product.find({ supplier: req.params.id, status: "published" })
+        .select("name description category price currency quantity unit minimumOrderQuantity supplier images createdAt")
+        .populate("supplier", "name businessName businessType city address isVerified")
+        .sort({ createdAt: -1 }).lean(),
+    ]);
+    if (!supplier || !products.length) return res.status(404).json({ message: "Supplier profile not found." });
+    return res.json({ supplier, products });
+  } catch (error) {
+    console.error("Public supplier profile error:", error);
+    return res.status(500).json({ message: "Failed to fetch supplier profile." });
+  }
+});
+
 // ========================================
 // GET SINGLE PUBLISHED PRODUCT
 // GET /api/products/:id
@@ -149,7 +211,7 @@ router.get("/:id", async (req, res) => {
       .select(
         "name description category price currency quantity unit minimumOrderQuantity supplier images createdAt"
       )
-      .populate("supplier", "name isVerified businessName city address verificationStatus")
+      .populate("supplier", "name email phone isVerified businessName businessType businessDescription city address verificationStatus")
       .lean();
 
     if (!product) {

@@ -19,6 +19,12 @@ const normalizePhone = (value) => {
   else if (/^8801[3-9]\d{8}$/.test(phone)) phone = `+${phone}`;
   return /^\+[1-9]\d{7,14}$/.test(phone) ? phone : null;
 };
+const normalizeBangladeshPhone = (value) => {
+  let phone = String(value || "").trim().replace(/[\s()-]/g, "");
+  if (/^01[3-9]\d{8}$/.test(phone)) return `+880${phone.slice(1)}`;
+  if (/^\+?8801[3-9]\d{8}$/.test(phone)) return phone.startsWith("+") ? phone : `+${phone}`;
+  return null;
+};
 
 const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
 const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
@@ -64,7 +70,7 @@ router.post("/register/send-code", limitVerificationRequests, async (req, res) =
   try {
     const { name, email, phone, password, role, verificationMethod } = req.body;
     const normalizedEmail = normalizeEmail(email);
-    const normalizedPhone = normalizePhone(phone);
+    const normalizedPhone = normalizeBangladeshPhone(phone);
 
     if (!name?.trim() || !isValidEmail(normalizedEmail) || !normalizedPhone || typeof password !== "string" || !password) {
       return res.status(400).json({
@@ -84,8 +90,8 @@ router.post("/register/send-code", limitVerificationRequests, async (req, res) =
       });
     }
 
-    if (!["email", "phone"].includes(verificationMethod)) {
-      return res.status(400).json({ message: "Choose email or phone for verification." });
+    if (verificationMethod !== "email") {
+      return res.status(400).json({ message: "Account verification is available by email only." });
     }
 
     const existingUser = await User.findOne({ $or: [{ email: normalizedEmail }, { phone: normalizedPhone }] }).select("email phone");
@@ -100,7 +106,7 @@ router.post("/register/send-code", limitVerificationRequests, async (req, res) =
       return res.status(500).json({ message: "Server verification secret is not configured." });
     }
 
-    const destination = verificationMethod === "email" ? normalizedEmail : normalizedPhone;
+    const destination = normalizedEmail;
     const existingCode = await VerificationCode.findOne({ channel: verificationMethod, destination });
     const now = new Date();
     if (existingCode && now.getTime() - existingCode.sentAt.getTime() < 60_000) {
@@ -139,18 +145,18 @@ router.post("/register", async (req, res) => {
   try {
     const { name, email, phone, password, role, verificationMethod, verificationCode } = req.body;
     const normalizedEmail = normalizeEmail(email);
-    const normalizedPhone = normalizePhone(phone);
+    const normalizedPhone = normalizeBangladeshPhone(phone);
 
     if (!name?.trim() || !isValidEmail(normalizedEmail) || !normalizedPhone || typeof password !== "string" || !password) {
       return res.status(400).json({ message: "Name, valid email, phone number and password are required." });
     }
     if (password.length < 8) return res.status(400).json({ message: "Password must be at least 8 characters long." });
     if (role && !["buyer", "supplier"].includes(role)) return res.status(403).json({ message: "Public registration cannot create admin accounts." });
-    if (!["email", "phone"].includes(verificationMethod) || !/^\d{6}$/.test(String(verificationCode || ""))) {
+    if (verificationMethod !== "email" || !/^\d{6}$/.test(String(verificationCode || ""))) {
       return res.status(400).json({ message: "Enter the six-digit verification code." });
     }
 
-    const destination = verificationMethod === "email" ? normalizedEmail : normalizedPhone;
+    const destination = normalizedEmail;
     const challenge = await VerificationCode.findOne({ channel: verificationMethod, destination, expiresAt: { $gt: new Date() } });
     if (!challenge) return res.status(400).json({ message: "Verification code is missing or expired. Request a new code." });
     if (challenge.attempts >= 5) return res.status(429).json({ message: "Too many incorrect codes. Request a new code." });
@@ -173,7 +179,7 @@ router.post("/register", async (req, res) => {
       name: name.trim(), email: normalizedEmail, phone: normalizedPhone,
       password: hashedPassword, role: role || "buyer",
       isEmailVerified: verificationMethod === "email",
-      isPhoneVerified: verificationMethod === "phone",
+      isPhoneVerified: false,
     });
 
     return res.status(201).json({
@@ -224,6 +230,10 @@ router.post("/login", async (req, res) => {
       return res.status(403).json({
         message: "Your account has been deactivated.",
       });
+    }
+
+    if (user.deletedAt) {
+      return res.status(403).json({ message: "This account was deleted and is in Trash. Contact an administrator to restore it." });
     }
 
     const token = jwt.sign(
@@ -411,7 +421,7 @@ router.get(
     }
 
     try {
-      const coAdmins = await User.find({ role: "co-admin" })
+      const coAdmins = await User.find({ role: "co-admin", deletedAt: null })
         .select("-password")
         .sort({ createdAt: -1 });
 
@@ -502,11 +512,12 @@ router.get(
   requirePermission("view_users"),
   async (req, res) => {
     try {
-      let filter = {};
+      let filter = { deletedAt: null };
 
       // Co-Admin can only see buyers and suppliers
       if (req.user.role === "co-admin") {
         filter = {
+          deletedAt: null,
           role: { $in: ["buyer", "supplier"] },
         };
       }
@@ -530,19 +541,83 @@ router.get(
   }
 );
 
-// Delete user
-router.delete(
+// List soft-deleted accounts for the Trash view.
+router.get(
+  "/admin/users/trash",
+  authMiddleware,
+  adminMiddleware,
+  requirePermission("view_users"),
+  async (req, res) => {
+    try {
+      const filter = { deletedAt: { $ne: null } };
+      if (req.user.role === "co-admin") filter.role = { $in: ["buyer", "supplier"] };
+      const users = await User.find(filter).select("-password").sort({ deletedAt: -1 });
+      return res.status(200).json({ users, totalUsers: users.length });
+    } catch (error) {
+      console.error("Trash list error:", error.message);
+      return res.status(500).json({ message: "Failed to fetch Trash." });
+    }
+  }
+);
+
+// Full account details are restricted to the Super Admin and permitted Co-Admins.
+router.get(
   "/admin/users/:id",
   authMiddleware,
   adminMiddleware,
-  (req, res, next) => {
-    if (req.user.role !== "admin") {
-      return res.status(403).json({
-        message: "Only the Super Admin can delete accounts.",
-      });
+  requirePermission("view_users"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid user ID." });
+      const target = await User.findById(id).select("+tradeLicenseDocument +governmentIdDocument +buyerBusinessDocument -password");
+      if (!target) return res.status(404).json({ message: "User not found." });
+      if (req.user.role === "co-admin" && !["buyer", "supplier"].includes(target.role)) {
+        return res.status(403).json({ message: "Co-Admins can only view buyer and supplier details." });
+      }
+      return res.status(200).json({ user: target });
+    } catch (error) {
+      console.error("User details error:", error.message);
+      return res.status(500).json({ message: "Failed to fetch user details." });
     }
-    next();
-  },
+  }
+);
+
+// Suspend or reactivate an account. Co-Admins can manage buyers and suppliers only.
+router.patch(
+  "/admin/users/:id/status",
+  authMiddleware,
+  adminMiddleware,
+  requirePermission("manage_users"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { isActive } = req.body;
+      if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid user ID." });
+      if (typeof isActive !== "boolean") return res.status(400).json({ message: "isActive must be true or false." });
+      if (id === req.user.userId) return res.status(400).json({ message: "You cannot change your own account status." });
+      const target = await User.findById(id);
+      if (!target) return res.status(404).json({ message: "User not found." });
+      if (target.deletedAt) return res.status(409).json({ message: "Restore this account from Trash before changing its status." });
+      if (req.user.role === "co-admin" && !["buyer", "supplier"].includes(target.role)) {
+        return res.status(403).json({ message: "Co-Admins can only suspend or reactivate buyers and suppliers." });
+      }
+      target.isActive = isActive;
+      await target.save();
+      return res.status(200).json({ message: isActive ? "Account reactivated." : "Account suspended.", user: { _id: target._id, isActive: target.isActive } });
+    } catch (error) {
+      console.error("Account status update error:", error.message);
+      return res.status(500).json({ message: "Failed to update account status." });
+    }
+  }
+);
+
+// Move an account to Trash without permanently deleting its data.
+router.patch(
+  "/admin/users/:id/trash",
+  authMiddleware,
+  adminMiddleware,
+  requirePermission("manage_users"),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -567,15 +642,25 @@ router.delete(
         });
       }
 
-      const deletedUser = await User.findByIdAndDelete(id);
+      if (req.user.role === "co-admin" && !["buyer", "supplier"].includes(targetUser.role)) {
+        return res.status(403).json({ message: "Co-Admins can only delete buyer and supplier accounts." });
+      }
+
+      if (targetUser.deletedAt) return res.status(409).json({ message: "This account is already in Trash." });
+
+      targetUser.isActive = false;
+      targetUser.deletedAt = new Date();
+      targetUser.deletedBy = req.user.userId;
+      await targetUser.save();
 
       return res.status(200).json({
-        message: "User deleted successfully.",
+        message: "Account moved to Trash. Restore it any time before permanent deletion.",
         deletedUser: {
-          id: deletedUser._id,
-          name: deletedUser.name,
-          email: deletedUser.email,
-          role: deletedUser.role,
+          id: targetUser._id,
+          name: targetUser.name,
+          email: targetUser.email,
+          role: targetUser.role,
+          deletedAt: targetUser.deletedAt,
         },
       });
     } catch (error) {
@@ -587,5 +672,85 @@ router.delete(
     }
   }
 );
+
+// Restore an account from Trash and make it usable again.
+router.patch(
+  "/admin/users/:id/restore",
+  authMiddleware,
+  adminMiddleware,
+  requirePermission("manage_users"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid user ID." });
+      const target = await User.findById(id);
+      if (!target || !target.deletedAt) return res.status(404).json({ message: "Deleted account not found in Trash." });
+      if (req.user.role === "co-admin" && !["buyer", "supplier"].includes(target.role)) {
+        return res.status(403).json({ message: "Co-Admins can only restore buyer and supplier accounts." });
+      }
+      target.deletedAt = null;
+      target.deletedBy = null;
+      target.isActive = true;
+      await target.save();
+      return res.status(200).json({ message: "Account restored and ready to use again.", user: { _id: target._id, isActive: true, deletedAt: null } });
+    } catch (error) {
+      console.error("Account restore error:", error.message);
+      return res.status(500).json({ message: "Failed to restore account." });
+    }
+  }
+);
+
+// Irreversible deletion is restricted to the Super Admin and to accounts already in Trash.
+router.delete(
+  "/admin/users/:id/permanent",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      if (req.user.role !== "admin") return res.status(403).json({ message: "Only the Super Admin can permanently delete accounts." });
+      const { id } = req.params;
+      if (!mongoose.isValidObjectId(id)) return res.status(400).json({ message: "Invalid user ID." });
+      if (id === req.user.userId) return res.status(400).json({ message: "You cannot permanently delete your own account." });
+      const target = await User.findById(id);
+      if (!target || !target.deletedAt) return res.status(404).json({ message: "Move this account to Trash before permanent deletion." });
+      await User.findByIdAndDelete(id);
+      return res.status(200).json({ message: "Account permanently deleted." });
+    } catch (error) {
+      console.error("Permanent account deletion error:", error.message);
+      return res.status(500).json({ message: "Failed to permanently delete account." });
+    }
+  }
+);
+
+// Super Admin can update their own login ID (email) and password, after confirming the current password.
+router.patch("/admin/account/credentials", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Only the Super Admin can change these credentials." });
+    const { currentPassword, newEmail, newPassword } = req.body;
+    if (typeof currentPassword !== "string" || !currentPassword || typeof newEmail !== "string" || !newEmail.trim() || typeof newPassword !== "string" || !newPassword) {
+      return res.status(400).json({ message: "Current password, new login email, and new password are required." });
+    }
+    const normalizedEmail = normalizeEmail(newEmail);
+    if (!isValidEmail(normalizedEmail)) return res.status(400).json({ message: "Enter a valid email address." });
+    if (newPassword.length < 8) return res.status(400).json({ message: "New password must be at least 8 characters long." });
+
+    const admin = await User.findById(req.user.userId).select("+password email");
+    if (!admin || !(await bcrypt.compare(currentPassword, admin.password))) {
+      return res.status(403).json({ message: "Current password is incorrect." });
+    }
+    const emailOwner = await User.findOne({ email: normalizedEmail }).select("_id");
+    if (emailOwner && emailOwner._id.toString() !== admin._id.toString()) {
+      return res.status(409).json({ message: "That email address is already in use." });
+    }
+
+    admin.email = normalizedEmail;
+    admin.password = await bcrypt.hash(newPassword, 10);
+    await admin.save();
+    return res.status(200).json({ message: "Super Admin login email and password updated.", user: { _id: admin._id, email: admin.email } });
+  } catch (error) {
+    console.error("Super Admin credential update error:", error.message);
+    return res.status(500).json({ message: "Failed to update Super Admin credentials." });
+  }
+});
 
 module.exports = router;

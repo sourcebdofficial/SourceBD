@@ -3,10 +3,21 @@ import { useEffect, useState } from "react";
 import "./Dashboard.css";
 
 const API_BASE = "http://localhost:5000/api";
+const readApiResponse = async (response) => {
+  const body = await response.text();
+  try {
+    return body ? JSON.parse(body) : {};
+  } catch {
+    const preview = body.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 140);
+    throw new Error(`Backend returned a non-JSON response (HTTP ${response.status}). Restart the Backend server and try again.${preview ? ` Response: ${preview}` : ""}`);
+  }
+};
 
 function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
   const [activeTab, setActiveTab] = useState("overview");
   const [users, setUsers] = useState([]);
+  const [trashedUsers, setTrashedUsers] = useState([]);
+  const [trashLoading, setTrashLoading] = useState(false);
   const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
   const [usersLoading, setUsersLoading] = useState(false);
@@ -16,18 +27,39 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
   const [coAdminForm, setCoAdminForm] = useState({ name: "", email: "", password: "", permissions: ["view_users"] });
   const [creatingCoAdmin, setCreatingCoAdmin] = useState(false);
   const [editingCoAdmin, setEditingCoAdmin] = useState(null);
+  const [userDetails, setUserDetails] = useState(null);
+  const [detailsLoading, setDetailsLoading] = useState(false);
+  const [userActionId, setUserActionId] = useState("");
+  const [credentialsModal, setCredentialsModal] = useState(false);
+  const [credentialsForm, setCredentialsForm] = useState({ currentPassword: "", newEmail: user?.email || "", newPassword: "", confirmPassword: "" });
+  const [credentialsSaving, setCredentialsSaving] = useState(false);
   const [editedPermissions, setEditedPermissions] = useState([]);
   const [savingPermissions, setSavingPermissions] = useState(false);
   const [logoSaving, setLogoSaving] = useState(false);
   const [verificationQueue, setVerificationQueue] = useState([]);
+  const [buyerVerificationQueue, setBuyerVerificationQueue] = useState([]);
   const [reviewQueue, setReviewQueue] = useState([]);
   const [categories, setCategories] = useState([]);
+  const currentUserId = user?._id || user?.id;
 
   const token = localStorage.getItem("token");
 
   const authHeaders = {
     Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
+  };
+
+  const ensureCurrentBackend = async () => {
+    let health;
+    try {
+      const response = await fetch(`${API_BASE}/health`);
+      health = await readApiResponse(response);
+    } catch {
+      throw new Error("The server on port 5000 is an older or different backend. Stop it, then run npm start from this project's Backend folder.");
+    }
+    if (!health?.userStatusRouteLoaded || !health?.userTrashRoutesLoaded) {
+      throw new Error("The server on port 5000 has not loaded the latest user-management routes. Stop it, then run npm start from this project's Backend folder.");
+    }
   };
 
   const getErrorMessage = (data, fallback) =>
@@ -42,7 +74,7 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
         { headers: authHeaders }
       );
 
-      const data = await response.json();
+      const data = await readApiResponse(response);
 
       if (!response.ok) {
         throw new Error(
@@ -88,21 +120,39 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
     }
   };
 
+  const fetchTrash = async () => {
+    setTrashLoading(true);
+    setMessage("");
+    try {
+      const response = await fetch(`${API_BASE}/auth/admin/users/trash`, { headers: authHeaders });
+      const data = await readApiResponse(response);
+      if (!response.ok) throw new Error(getErrorMessage(data, "Could not load Trash."));
+      setTrashedUsers(data.users || []);
+    } catch (error) {
+      setMessage(error.message || "Could not load Trash.");
+    } finally {
+      setTrashLoading(false);
+    }
+  };
+
   const fetchSourcingQueues = async () => {
     try {
-      const [verificationResponse, reviewResponse, categoryResponse] = await Promise.all([
+      const [verificationResponse, reviewResponse, categoryResponse, buyerVerificationResponse] = await Promise.all([
         fetch(`${API_BASE}/sourcing/admin/verification`, { headers: authHeaders }),
         fetch(`${API_BASE}/sourcing/admin/reviews`, { headers: authHeaders }),
         fetch(`${API_BASE}/sourcing/categories`),
+        fetch(`${API_BASE}/sourcing/admin/buyer-verification`, { headers: authHeaders }),
       ]);
-      const [verificationData, reviewData, categoryData] = await Promise.all([
-        verificationResponse.json(), reviewResponse.json(), categoryResponse.json(),
+      const [verificationData, reviewData, categoryData, buyerVerificationData] = await Promise.all([
+        verificationResponse.ok ? verificationResponse.json() : Promise.resolve({}),
+        reviewResponse.ok ? reviewResponse.json() : Promise.resolve({}),
+        categoryResponse.ok ? categoryResponse.json() : Promise.resolve({}),
+        buyerVerificationResponse.ok ? buyerVerificationResponse.json() : Promise.resolve({}),
       ]);
-      if (!verificationResponse.ok) throw new Error(getErrorMessage(verificationData, "Could not load supplier requests."));
-      if (!reviewResponse.ok) throw new Error(getErrorMessage(reviewData, "Could not load reviews."));
-      setVerificationQueue(verificationData.suppliers || []);
-      setReviewQueue(reviewData.reviews || []);
-      setCategories(categoryData.categories || []);
+      if (verificationResponse.ok) setVerificationQueue(verificationData.suppliers || []);
+      if (buyerVerificationResponse.ok) setBuyerVerificationQueue(buyerVerificationData.buyers || []);
+      if (reviewResponse.ok) setReviewQueue(reviewData.reviews || []);
+      if (categoryResponse.ok) setCategories(categoryData.categories || []);
     } catch (error) { setMessage(error.message); }
   };
 
@@ -125,6 +175,18 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
       const data = await response.json();
       if (!response.ok) throw new Error(getErrorMessage(data, "Could not update verification."));
       setMessage(`Supplier ${decision}.`);
+      fetchSourcingQueues();
+      fetchUsers();
+    } catch (error) { setMessage(error.message); }
+  };
+
+  const reviewBuyer = async (buyer, decision) => {
+    const note = decision === "rejected" ? (window.prompt("Reason for rejection (optional):") || "") : "";
+    try {
+      const response = await fetch(`${API_BASE}/sourcing/admin/buyer-verification/${buyer._id}`, { method: "PATCH", headers: authHeaders, body: JSON.stringify({ decision, note }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(getErrorMessage(data, "Could not update buyer verification."));
+      setMessage(`Buyer ${decision}.`);
       fetchSourcingQueues();
       fetchUsers();
     } catch (error) { setMessage(error.message); }
@@ -292,15 +354,15 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
       return;
     }
 
-    if (selectedUser._id === user?._id) {
+    if (selectedUser._id === currentUserId) {
       setMessage("You cannot delete your own account here.");
       return;
     }
 
     const confirmed = window.confirm(
-      `Are you sure you want to delete ${
+      `Move ${
         selectedUser.name || selectedUser.email
-      }?`
+      } to Trash? They will be unable to sign in until you restore the account.`
     );
 
     if (!confirmed) return;
@@ -309,14 +371,14 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
       setMessage("");
 
       const response = await fetch(
-        `${API_BASE}/auth/admin/users/${selectedUser._id}`,
+        `${API_BASE}/auth/admin/users/${selectedUser._id}/trash`,
         {
-          method: "DELETE",
+          method: "PATCH",
           headers: authHeaders,
         }
       );
 
-      const data = await response.json();
+      const data = await readApiResponse(response);
 
       if (!response.ok) {
         throw new Error(
@@ -330,10 +392,118 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
         )
       );
 
-      setMessage("User deleted successfully.");
+      setMessage(data.message || "Account moved to Trash.");
+      fetchTrash();
       fetchDashboard();
     } catch (error) {
       setMessage(error.message || "Could not delete user.");
+    }
+  };
+
+  const restoreUser = async (selectedUser) => {
+    if (!window.confirm(`Restore ${selectedUser.name || selectedUser.email}? They will be able to use the account again.`)) return;
+    setUserActionId(selectedUser._id);
+    setMessage("");
+    try {
+      const response = await fetch(`${API_BASE}/auth/admin/users/${selectedUser._id}/restore`, { method: "PATCH", headers: authHeaders });
+      const data = await readApiResponse(response);
+      if (!response.ok) throw new Error(getErrorMessage(data, "Could not restore this account."));
+      setTrashedUsers((current) => current.filter((item) => item._id !== selectedUser._id));
+      setMessage(data.message || "Account restored and ready to use again.");
+      fetchUsers();
+      fetchDashboard();
+    } catch (error) {
+      setMessage(error.message || "Could not restore this account.");
+    } finally {
+      setUserActionId("");
+    }
+  };
+
+  const permanentlyDeleteUser = async (selectedUser) => {
+    if (user?.role !== "admin") return;
+    const confirmation = window.prompt(`Permanently delete ${selectedUser.name || selectedUser.email}? This cannot be undone. Type DELETE to continue.`);
+    if (confirmation !== "DELETE") return;
+    setUserActionId(selectedUser._id);
+    setMessage("");
+    try {
+      const response = await fetch(`${API_BASE}/auth/admin/users/${selectedUser._id}/permanent`, { method: "DELETE", headers: authHeaders });
+      const data = await readApiResponse(response);
+      if (!response.ok) throw new Error(getErrorMessage(data, "Could not permanently delete this account."));
+      setTrashedUsers((current) => current.filter((item) => item._id !== selectedUser._id));
+      setMessage(data.message || "Account permanently deleted.");
+      fetchDashboard();
+    } catch (error) {
+      setMessage(error.message || "Could not permanently delete this account.");
+    } finally {
+      setUserActionId("");
+    }
+  };
+
+  const openUserDetails = async (selectedUser) => {
+    setUserDetails({ loading: true, name: selectedUser.name, email: selectedUser.email });
+    setDetailsLoading(true);
+    try {
+      await ensureCurrentBackend();
+      const response = await fetch(`${API_BASE}/auth/admin/users/${selectedUser._id}`, { headers: authHeaders });
+      const data = await readApiResponse(response);
+      if (!response.ok) throw new Error(getErrorMessage(data, "Could not load user details."));
+      setUserDetails(data.user);
+    } catch (error) {
+      setUserDetails({ error: error.message || "Could not load user details." });
+    } finally {
+      setDetailsLoading(false);
+    }
+  };
+
+  const handleUserStatus = async (selectedUser) => {
+    const nextActive = selectedUser.isActive === false;
+    const verb = nextActive ? "reactivate" : "suspend";
+    if (!window.confirm(`Are you sure you want to ${verb} ${selectedUser.name || selectedUser.email}?`)) return;
+    setUserActionId(selectedUser._id);
+    setMessage("");
+    try {
+      await ensureCurrentBackend();
+      const response = await fetch(`${API_BASE}/auth/admin/users/${selectedUser._id}/status`, {
+        method: "PATCH", headers: authHeaders, body: JSON.stringify({ isActive: nextActive }),
+      });
+      const data = await readApiResponse(response);
+      if (!response.ok) throw new Error(getErrorMessage(data, `Could not ${verb} this account.`));
+      setUsers((current) => current.map((item) => item._id === selectedUser._id ? { ...item, isActive: nextActive } : item));
+      setUserDetails((current) => current?._id === selectedUser._id ? { ...current, isActive: nextActive } : current);
+      setMessage(data.message || `Account ${nextActive ? "reactivated" : "suspended"}.`);
+    } catch (error) {
+      setMessage(error.message || `Could not ${verb} this account.`);
+    } finally {
+      setUserActionId("");
+    }
+  };
+
+  const saveOwnCredentials = async (event) => {
+    event.preventDefault();
+    setMessage("");
+    if (credentialsForm.newPassword !== credentialsForm.confirmPassword) {
+      setMessage("New password and confirmation do not match.");
+      return;
+    }
+    setCredentialsSaving(true);
+    try {
+      const response = await fetch(`${API_BASE}/auth/admin/account/credentials`, {
+        method: "PATCH",
+        headers: authHeaders,
+        body: JSON.stringify({ currentPassword: credentialsForm.currentPassword, newEmail: credentialsForm.newEmail, newPassword: credentialsForm.newPassword }),
+      });
+      const data = await readApiResponse(response);
+      if (!response.ok) throw new Error(getErrorMessage(data, "Could not update login credentials."));
+      const storedUser = JSON.parse(localStorage.getItem("user") || "{}");
+      localStorage.setItem("user", JSON.stringify({ ...storedUser, email: data.user.email }));
+      setUsers((current) => current.map((item) => item._id === currentUserId ? { ...item, email: data.user.email } : item));
+      setCredentialsModal(false);
+      setCredentialsForm({ currentPassword: "", newEmail: data.user.email, newPassword: "", confirmPassword: "" });
+      setMessage(`${data.message} Refresh the page to show the new login email everywhere.`);
+    } catch (error) {
+      setMessage(error.message || "Could not update login credentials.");
+    } finally {
+      setCredentialsSaving(false);
     }
   };
 
@@ -381,6 +551,14 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
       (item) =>
         item.role === "admin" || item.role === "co-admin"
     ).length;
+  const canReviewBuyers = user?.role === "admin" || user?.permissions?.includes("view_users");
+  const canManageBuyerVerifications = user?.role === "admin" || user?.permissions?.includes("manage_users");
+  const canManageUsers = user?.role === "admin" || user?.permissions?.includes("manage_users");
+  const detailSections = userDetails && !userDetails.loading && !userDetails.error ? [
+    ["Contact", [["Full name", userDetails.name], ["Email", userDetails.email], ["Phone", userDetails.phone], ["Email verified", userDetails.isEmailVerified ? "Yes" : "No"], ["Phone verified", userDetails.isPhoneVerified ? "Yes" : "No"]]],
+    ["Business & address", [["Business name", userDetails.businessName || userDetails.organizationName], ["Business type", userDetails.businessType || userDetails.buyerType], ["Contact person", userDetails.contactPerson], ["Designation", userDetails.designation || userDetails.buyerDesignation], ["Address", [userDetails.address, userDetails.city, userDetails.postalCode, userDetails.country].filter(Boolean).join(", ")], ["Website", userDetails.website], ["Description", userDetails.businessDescription]]],
+    ["Registration & verification", [["Registration type", userDetails.businessRegistrationType], ["Trade license number", userDetails.tradeLicenseNumber], ["Business registration number", userDetails.businessRegistrationNumber], ["TIN", userDetails.taxIdentificationNumber], ["VAT / BIN", userDetails.vatBinNumber], ["Government ID type", userDetails.governmentIdType], ["Government ID number", userDetails.governmentIdNumber], ["Verification status", userDetails.verificationStatus], ["Joined", userDetails.createdAt ? new Date(userDetails.createdAt).toLocaleString() : ""]]],
+  ] : [];
 
   return (
     <div className="dashboard-page admin-dashboard">
@@ -401,6 +579,7 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
           </button>
 
           <button className={activeTab === "verification" ? "active" : ""} onClick={() => { setActiveTab("verification"); fetchSourcingQueues(); }}>Supplier Verification</button>
+          {canReviewBuyers && <button className={activeTab === "buyer-verification" ? "active" : ""} onClick={() => { setActiveTab("buyer-verification"); fetchSourcingQueues(); }}>Buyer Verification {buyerVerificationQueue.length > 0 && <span className="admin-nav-count">{buyerVerificationQueue.length}</span>}</button>}
           <button className={activeTab === "reviews" ? "active" : ""} onClick={() => { setActiveTab("reviews"); fetchSourcingQueues(); }}>Review Moderation</button>
           <button className={activeTab === "categories" ? "active" : ""} onClick={() => { setActiveTab("categories"); fetchSourcingQueues(); }}>Categories</button>
 
@@ -412,6 +591,7 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
           >
             Users Management
           </button>
+          {canReviewBuyers && <button className={activeTab === "trash" ? "active" : ""} onClick={() => { setActiveTab("trash"); fetchTrash(); }}>Trash {trashedUsers.length > 0 && <span className="admin-nav-count">{trashedUsers.length}</span>}</button>}
 
           {user?.role === "admin" && (
             <button className={activeTab === "create-co-admin" ? "active" : ""} onClick={() => setActiveTab("create-co-admin")}>
@@ -446,7 +626,7 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
       <main className="dashboard-main admin-main">
         <header className="dashboard-header admin-header">
           <div>
-            <h1>{{ overview: "Admin Overview", users: "Users Management", "create-co-admin": "Create Co-Admin", "site-logo": "Change Site Logo", profile: "My Account", verification: "Supplier Verification", reviews: "Review Moderation", categories: "Category Management" }[activeTab] || "Admin Panel"}</h1>
+            <h1>{{ overview: "Admin Overview", users: "Users Management", trash: "Deleted Accounts", "create-co-admin": "Create Co-Admin", "site-logo": "Change Site Logo", profile: "My Account", verification: "Supplier Verification", "buyer-verification": "Buyer Verification", reviews: "Review Moderation", categories: "Category Management" }[activeTab] || "Admin Panel"}</h1>
 
             <p>Welcome back, {user?.name || user?.email || "Admin"}. Here’s what’s happening on SourceBD.</p>
           </div>
@@ -526,13 +706,10 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
                 <p>Browse registered accounts by account type.</p>
               </div>
 
-              <button
-                className="dashboard-secondary-button"
-                onClick={fetchUsers}
-                disabled={usersLoading}
-              >
-                {usersLoading ? "Loading..." : "Refresh"}
-              </button>
+              <div className="admin-table-toolbar-actions">
+                <button className="dashboard-secondary-button" onClick={fetchUsers} disabled={usersLoading}>{usersLoading ? "Loading..." : "Refresh"}</button>
+                {canReviewBuyers && <button className="dashboard-secondary-button" onClick={() => { setActiveTab("trash"); fetchTrash(); }}>Open Trash{trashedUsers.length > 0 ? ` (${trashedUsers.length})` : ""}</button>}
+              </div>
             </div>
 
             <div className="admin-role-filters" role="tablist" aria-label="Filter users by account type">
@@ -579,16 +756,16 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
                             : "Inactive"}</span>
                         </td>
                         <td>
-                          {item._id === user?._id ? (
-                            <span>Current account</span>
-                          ) : user?.role !== "admin" ? (
-                            <span className="admin-protected-label">Super Admin only</span>
-                          ) : (
-                            <div className="admin-user-actions">
-                              {item.role === "co-admin" && <button className="admin-edit-permissions-button" onClick={() => openPermissionEditor(item)}>Edit permissions</button>}
-                              <button className="dashboard-danger-button" onClick={() => handleDeleteUser(item)}>Delete</button>
-                            </div>
-                          )}
+                          <div className="admin-user-actions">
+                            <button className="admin-details-button" type="button" onClick={() => openUserDetails(item)}>Details</button>
+                            {item._id === currentUserId ? (user?.role === "admin" ? <button className="admin-edit-permissions-button" type="button" onClick={() => { setCredentialsForm({ currentPassword: "", newEmail: item.email || user.email || "", newPassword: "", confirmPassword: "" }); setCredentialsModal(true); }}>Change login ID &amp; password</button> : <span className="admin-protected-label">Current account</span>) : canManageUsers && (
+                              <>
+                                {user?.role === "admin" && item.role === "co-admin" && <button className="admin-edit-permissions-button" onClick={() => openPermissionEditor(item)}>Edit permissions</button>}
+                                <button className={item.isActive === false ? "admin-reactivate-button" : "admin-suspend-button"} disabled={userActionId === item._id} onClick={() => handleUserStatus(item)}>{userActionId === item._id ? "Saving..." : item.isActive === false ? "Reactivate" : "Suspend"}</button>
+                                <button className="dashboard-danger-button" disabled={userActionId === item._id} onClick={() => handleDeleteUser(item)}>Move to Trash</button>
+                              </>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     ))}
@@ -602,6 +779,33 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
                     )}
                   </tbody>
                 </table>
+              </div>
+            )}
+            {userDetails && (
+              <div className="admin-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !detailsLoading) setUserDetails(null); }}>
+                <section className="admin-user-details-modal" role="dialog" aria-modal="true" aria-labelledby="user-details-title">
+                  <div className="admin-modal-heading"><div><span className="admin-eyebrow">ACCOUNT PROFILE</span><h3 id="user-details-title">{userDetails.name || "User details"}</h3><p>{userDetails.email || ""}</p></div><button type="button" aria-label="Close" onClick={() => setUserDetails(null)}>×</button></div>
+                  {detailsLoading || userDetails.loading ? <p className="admin-details-loading">Loading complete profile…</p> : userDetails.error ? <p className="admin-details-error">{userDetails.error}</p> : <>
+                    <div className="admin-details-badges"><span className={`admin-user-role role-${userDetails.role}`}>{userDetails.role}</span><span className={`admin-user-status ${userDetails.isActive === false ? "is-inactive" : "is-active"}`}>{userDetails.isActive === false ? "Suspended" : "Active"}</span><span className={`admin-user-status ${userDetails.isVerified ? "is-active" : ""}`}>{userDetails.isVerified ? "Verified" : "Not verified"}</span></div>
+                    <div className="admin-details-grid">
+                      {detailSections.map(([title, fields]) => <section className="admin-details-group" key={title}><h4>{title}</h4>{fields.filter(([, value]) => value !== undefined && value !== null && value !== "").map(([label, value]) => <p key={label}><strong>{label}</strong><span>{value}</span></p>)}</section>)}
+                    </div>
+                    <div className="admin-details-documents"><h4>Submitted documents</h4>{[["Trade license", userDetails.tradeLicenseDocument], ["Business registration", userDetails.buyerBusinessDocument], ["Government ID", userDetails.governmentIdDocument]].filter(([, value]) => value).length ? [["Trade license", userDetails.tradeLicenseDocument], ["Business registration", userDetails.buyerBusinessDocument], ["Government ID", userDetails.governmentIdDocument]].filter(([, value]) => value).map(([label, value]) => <a key={label} href={value} target="_blank" rel="noreferrer">↗ View {label}</a>) : <p>No documents were submitted.</p>}</div>
+                  </>}
+                  <div className="admin-modal-actions"><button className="dashboard-secondary-button" onClick={() => setUserDetails(null)}>Close</button></div>
+                </section>
+              </div>
+            )}
+            {credentialsModal && (
+              <div className="admin-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !credentialsSaving) setCredentialsModal(false); }}>
+                <form className="admin-credentials-modal" onSubmit={saveOwnCredentials} role="dialog" aria-modal="true" aria-labelledby="credentials-modal-title">
+                  <div className="admin-modal-heading"><div><span className="admin-eyebrow">SUPER ADMIN ACCOUNT</span><h3 id="credentials-modal-title">Change login details</h3><p>Confirm your current password before saving the new email and password.</p></div><button type="button" aria-label="Close" disabled={credentialsSaving} onClick={() => setCredentialsModal(false)}>×</button></div>
+                  <label>Current password<input type="password" autoComplete="current-password" value={credentialsForm.currentPassword} onChange={(event) => setCredentialsForm((current) => ({ ...current, currentPassword: event.target.value }))} required /></label>
+                  <label>New login ID (email)<input type="email" autoComplete="email" value={credentialsForm.newEmail} onChange={(event) => setCredentialsForm((current) => ({ ...current, newEmail: event.target.value }))} required /></label>
+                  <label>New password<input type="password" minLength="8" autoComplete="new-password" value={credentialsForm.newPassword} onChange={(event) => setCredentialsForm((current) => ({ ...current, newPassword: event.target.value }))} required /></label>
+                  <label>Confirm new password<input type="password" minLength="8" autoComplete="new-password" value={credentialsForm.confirmPassword} onChange={(event) => setCredentialsForm((current) => ({ ...current, confirmPassword: event.target.value }))} required /></label>
+                  <div className="admin-modal-actions"><button className="dashboard-secondary-button" type="button" disabled={credentialsSaving} onClick={() => setCredentialsModal(false)}>Cancel</button><button className="dashboard-primary-button" type="submit" disabled={credentialsSaving}>{credentialsSaving ? "Saving…" : "Save login details"}</button></div>
+                </form>
               </div>
             )}
             {editingCoAdmin && (
@@ -621,6 +825,20 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
                 </section>
               </div>
             )}
+          </section>
+        )}
+
+        {activeTab === "trash" && canReviewBuyers && (
+          <section className="dashboard-content admin-content">
+            <div className="dashboard-section-heading">
+              <div><h2>Deleted accounts</h2><p>Accounts here cannot sign in. Restore one to make it usable again, or permanently delete it.</p></div>
+              <button className="dashboard-secondary-button" onClick={fetchTrash} disabled={trashLoading}>{trashLoading ? "Loading..." : "Refresh Trash"}</button>
+            </div>
+            {trashLoading ? <p>Loading deleted accounts...</p> : <div className="dashboard-table-wrapper"><table className="dashboard-table"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Moved to Trash</th><th>Actions</th></tr></thead><tbody>
+              {trashedUsers.map((item) => <tr key={item._id}><td>{item.name || "—"}</td><td>{item.email || "—"}</td><td><span className={`admin-user-role role-${item.role || "unknown"}`}>{item.role || "—"}</span></td><td>{item.deletedAt ? new Date(item.deletedAt).toLocaleString() : "—"}</td><td><div className="admin-user-actions">{canManageUsers && <button className="admin-reactivate-button" disabled={userActionId === item._id} onClick={() => restoreUser(item)}>{userActionId === item._id ? "Working..." : "Undo / Restore"}</button>}{user?.role === "admin" && <button className="dashboard-danger-button" disabled={userActionId === item._id} onClick={() => permanentlyDeleteUser(item)}>Permanent delete</button>}</div></td></tr>)}
+              {trashedUsers.length === 0 && <tr><td colSpan="5" className="admin-trash-empty">Trash is empty. Deleted accounts will appear here.</td></tr>}
+            </tbody></table></div>}
+            {user?.role !== "admin" && <p className="admin-readonly-note">Only the Super Admin can permanently delete an account.</p>}
           </section>
         )}
 
@@ -687,7 +905,9 @@ function AdminDashboard({ user, onLogout, logoData, onLogoChange }) {
           </section>
         )}
 
-        {activeTab === "verification" && <section className="dashboard-content"><h2>Pending Supplier Verification</h2>{verificationQueue.length ? verificationQueue.map((supplier) => <article className="dashboard-panel" key={supplier._id}><h3>{supplier.businessName} · {supplier.name}</h3><p>{supplier.businessType}</p><p>{supplier.businessDescription}</p><p>{supplier.address}, {supplier.city}</p><p>{supplier.email} · {supplier.phone || "No phone"}</p><button className="dashboard-primary-button" onClick={() => reviewSupplier(supplier, "verified")}>Verify Supplier</button> <button className="dashboard-danger-button" onClick={() => reviewSupplier(supplier, "rejected")}>Reject</button></article>) : <p className="dashboard-empty">No supplier requests pending.</p>}</section>}
+        {activeTab === "verification" && <section className="dashboard-content"><h2>Pending Supplier Verification</h2>{verificationQueue.length ? verificationQueue.map((supplier) => <article className="dashboard-panel admin-verification-card" key={supplier._id}><div className="admin-verification-heading"><div><span className="admin-eyebrow">SUPPLIER APPLICATION</span><h3>{supplier.businessName} · {supplier.name}</h3></div><span className="admin-verification-pending">Pending review</span></div><div className="admin-verification-details"><p><strong>Business type</strong>{supplier.businessType || "—"}</p><p><strong>Registration type</strong>{supplier.businessRegistrationType || "—"}</p><p><strong>Contact person</strong>{supplier.contactPerson || supplier.name || "—"}{supplier.designation && ` · ${supplier.designation}`}</p><p><strong>Email</strong>{supplier.email || "—"}</p><p><strong>Phone</strong>{supplier.phone || "—"}</p><p><strong>Trade license number</strong>{supplier.tradeLicenseNumber || "—"}</p><p><strong>TIN</strong>{supplier.taxIdentificationNumber || "Not provided"}</p><p><strong>VAT / BIN</strong>{supplier.vatBinNumber || "Not provided"}</p><p><strong>Website</strong>{supplier.website || "Not provided"}</p><p><strong>Business address</strong>{[supplier.address, supplier.city].filter(Boolean).join(", ") || "—"}</p></div><div className="admin-verification-description"><strong>Business description</strong><p>{supplier.businessDescription || "Not provided"}</p></div>{supplier.tradeLicenseDocument && <a className="admin-verification-document" href={supplier.tradeLicenseDocument} target="_blank" rel="noreferrer">↗ View submitted trade license document</a>}<div className="admin-verification-actions"><button className="dashboard-primary-button" onClick={() => reviewSupplier(supplier, "verified")}>Verify supplier</button><button className="dashboard-danger-button" onClick={() => reviewSupplier(supplier, "rejected")}>Reject application</button></div></article>) : <p className="dashboard-empty">No supplier requests pending.</p>}</section>}
+
+        {activeTab === "buyer-verification" && canReviewBuyers && <section className="dashboard-content"><h2>Pending Buyer Verification</h2>{buyerVerificationQueue.length ? buyerVerificationQueue.map((buyer) => <article className="dashboard-panel admin-verification-card" key={buyer._id}><div className="admin-verification-heading"><div><span className="admin-eyebrow">BUYER APPLICATION</span><h3>{buyer.name} {buyer.buyerType === "business" && `· ${buyer.organizationName}`}</h3></div><span className="admin-verification-pending">Pending review</span></div><div className="admin-verification-details"><p><strong>Buyer type</strong>{buyer.buyerType === "business" ? "Business" : "Individual"}</p><p><strong>Email</strong>{buyer.email || "—"}</p><p><strong>Phone</strong>{buyer.phone || "—"}</p><p><strong>Delivery / contact address</strong>{[buyer.address, buyer.city, buyer.postalCode, buyer.country].filter(Boolean).join(", ") || "—"}</p><p><strong>ID document type</strong>{buyer.governmentIdType || "—"}</p><p><strong>ID number</strong>{buyer.governmentIdNumber || "—"}</p>{buyer.buyerType === "business" && <><p><strong>Organization</strong>{buyer.organizationName || "—"}</p><p><strong>Role</strong>{buyer.buyerDesignation || "Not provided"}</p><p><strong>Business registration</strong>{buyer.businessRegistrationNumber || "—"}</p></>}</div><div className="admin-verification-actions">{buyer.governmentIdDocument && <a className="admin-verification-document" href={buyer.governmentIdDocument} target="_blank" rel="noreferrer">↗ View identity document</a>}{buyer.buyerBusinessDocument && <a className="admin-verification-document" href={buyer.buyerBusinessDocument} target="_blank" rel="noreferrer">↗ View business license</a>}</div>{canManageBuyerVerifications ? <div className="admin-verification-actions"><button className="dashboard-primary-button" onClick={() => reviewBuyer(buyer, "verified")}>Verify buyer</button><button className="dashboard-danger-button" onClick={() => reviewBuyer(buyer, "rejected")}>Reject application</button></div> : <p className="admin-readonly-note">Your co-admin role can view this request, but does not have permission to approve or reject it.</p>}</article>) : <p className="dashboard-empty">No buyer verification requests are pending.</p>}</section>}
 
         {activeTab === "reviews" && <section className="dashboard-content"><h2>Pending Reviews</h2>{reviewQueue.length ? reviewQueue.map((review) => <article className="dashboard-panel" key={review._id}><h3>{review.product?.name || "Product"} · {review.rating}/5</h3><p><strong>Buyer:</strong> {review.buyer?.name || review.buyer?.email || "—"}</p><p><strong>Supplier:</strong> {review.supplier?.name || "—"}</p><p>{review.comment || "No written comment."}</p><button className="dashboard-primary-button" onClick={() => moderateReview(review, "approved")}>Approve</button> <button className="dashboard-danger-button" onClick={() => moderateReview(review, "rejected")}>Reject</button></article>) : <p className="dashboard-empty">No reviews waiting for moderation.</p>}</section>}
 

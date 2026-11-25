@@ -78,8 +78,10 @@ function Login({ onLoginSuccess, onBack }) {
   return (
     <div className="register-page">
       <form className="register-form" onSubmit={handleSubmit}>
-        <h2>Welcome Back to SourceBD</h2>
-        <p>Log in to your account.</p>
+        <div className="auth-brand"><span className="auth-brand-mark">S</span><span>Source<span>BD</span></span></div>
+        <span className="auth-kicker">BANGLADESH WHOLESALE SOURCING</span>
+        <h2>Welcome back</h2>
+        <p>Sign in to continue to your SourceBD account.</p>
 
         <label htmlFor="login-identifier">Email or Phone Number</label>
         <input
@@ -88,7 +90,7 @@ function Login({ onLoginSuccess, onBack }) {
           name="identifier"
           value={form.identifier}
           onChange={handleChange}
-          placeholder="Enter email or verified phone number"
+          placeholder="Enter your email or verified phone number"
           autoComplete="username"
           required
         />

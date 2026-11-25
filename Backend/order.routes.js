@@ -72,6 +72,10 @@ router.post("/", requireRole("buyer"), async (req, res) => {
       });
     }
 
+    if (typeof shippingAddress !== "string" || !shippingAddress.trim()) {
+      return res.status(400).json({ success: false, message: "Delivery address is required." });
+    }
+
     const product = await Product.findOne({
       _id: productId,
       status: "published",
@@ -136,7 +140,7 @@ router.post("/", requireRole("buyer"), async (req, res) => {
       currency: product.currency,
       totalPrice,
       note: note || "",
-      shippingAddress: shippingAddress || "",
+      shippingAddress: shippingAddress.trim(),
       status: "pending",
     });
 
@@ -176,8 +180,8 @@ router.get("/my", requireRole("buyer"), async (req, res) => {
     const orders = await Order.find({
       buyer: req.user.userId,
     })
-      .populate("supplier", "name email phone")
-      .populate("product", "name category")
+      .populate("supplier", "name businessName email phone address city isVerified")
+      .populate("product", "name description category unit minimumOrderQuantity images")
       .sort({ createdAt: -1 });
 
     return res.status(200).json({
@@ -207,8 +211,8 @@ router.get(
       const orders = await Order.find({
         supplier: req.user.userId,
       })
-        .populate("buyer", "name email phone")
-        .populate("product", "name category")
+        .populate("buyer", "name email phone address city isVerified")
+        .populate("product", "name description category unit minimumOrderQuantity images")
         .sort({ createdAt: -1 });
 
       return res.status(200).json({

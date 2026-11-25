@@ -30,7 +30,7 @@ async function authMiddleware(req, res, next) {
 
     // Always check the latest user data from the database
     const user = await User.findById(decoded.userId).select(
-      "_id name email role permissions isActive"
+      "_id name email role permissions isActive deletedAt"
     );
 
     if (!user) {
@@ -42,6 +42,12 @@ async function authMiddleware(req, res, next) {
     if (!user.isActive) {
       return res.status(403).json({
         message: "Your account has been deactivated.",
+      });
+    }
+
+    if (user.deletedAt) {
+      return res.status(403).json({
+        message: "This account is in Trash and cannot be used until it is restored.",
       });
     }
 

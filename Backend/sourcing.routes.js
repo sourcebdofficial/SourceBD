@@ -27,6 +27,17 @@ const requireRole = (role) => (req, res, next) => {
 
 const validId = (id) => mongoose.isValidObjectId(id);
 
+const isValidPrivateDocument = (dataUrl) => {
+  if (typeof dataUrl !== "string") return false;
+  const match = dataUrl.match(/^data:(application\/pdf|image\/(jpeg|png));base64,([A-Za-z0-9+/=]+)$/);
+  if (!match) return false;
+  const buffer = Buffer.from(match[3], "base64");
+  if (!buffer.length || buffer.length > 900_000) return false;
+  return (match[1] === "application/pdf" && buffer.subarray(0, 5).toString() === "%PDF-") ||
+    (match[1] === "image/jpeg" && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) ||
+    (match[1] === "image/png" && buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])));
+};
+
 // Categories are public for filters and managed by admins.
 router.get("/categories", async (req, res) => {
   try {
@@ -206,20 +217,33 @@ router.patch("/inquiries/:id/respond", authMiddleware, requireRole("supplier"), 
 
 // Supplier verification requests are reviewed by admins; legacy isVerified remains intact.
 router.post("/supplier/verification", authMiddleware, requireRole("supplier"), async (req, res) => {
-  const fields = ["businessName", "businessType", "businessDescription", "address", "city"];
+  const fields = ["businessName", "businessType", "businessDescription", "address", "city", "phone", "contactPerson", "businessRegistrationType", "tradeLicenseNumber", "tradeLicenseDocument"];
   const updates = {};
   for (const field of fields) {
     if (typeof req.body[field] !== "string" || !req.body[field].trim()) return res.status(400).json({ message: `${field} is required.` });
     updates[field] = req.body[field].trim();
   }
-  if (updates.businessName.length > 150 || updates.businessDescription.length > 1000 || updates.address.length > 300) return res.status(400).json({ message: "Business details exceed the allowed length." });
-  const supplier = await User.findOneAndUpdate({ _id: req.user.userId, role: "supplier", isActive: true, verificationStatus: { $nin: ["pending", "verified"] } }, { $set: { ...updates, verificationStatus: "pending", verificationNote: "", isVerified: false } }, { new: true, runValidators: true }).select("name businessName businessType businessDescription address city verificationStatus isVerified");
+  for (const field of ["designation", "taxIdentificationNumber", "vatBinNumber", "website"]) {
+    if (req.body[field] !== undefined && (typeof req.body[field] !== "string" || req.body[field].length > 300)) return res.status(400).json({ message: `${field} must be text up to 300 characters.` });
+    if (req.body[field] !== undefined) updates[field] = req.body[field].trim();
+  }
+  const limits = { businessName: 150, businessType: 100, businessDescription: 1000, address: 300, city: 100, phone: 40, contactPerson: 150, businessRegistrationType: 100, tradeLicenseNumber: 100 };
+  if (Object.entries(limits).some(([field, max]) => updates[field].length > max)) return res.status(400).json({ message: "Some business details exceed the allowed length." });
+  const documentMatch = updates.tradeLicenseDocument.match(/^data:(application\/pdf|image\/(jpeg|png));base64,([A-Za-z0-9+/=]+)$/);
+  if (!documentMatch) return res.status(400).json({ message: "Upload the trade license as a PDF, JPG or PNG file." });
+  const documentBuffer = Buffer.from(documentMatch[3], "base64");
+  if (!documentBuffer.length || documentBuffer.length > 1_500_000) return res.status(400).json({ message: "Trade license file must be smaller than 1.5 MB." });
+  const validPdf = documentMatch[1] === "application/pdf" && documentBuffer.subarray(0, 5).toString() === "%PDF-";
+  const validJpeg = documentMatch[1] === "image/jpeg" && documentBuffer[0] === 0xff && documentBuffer[1] === 0xd8 && documentBuffer[2] === 0xff;
+  const validPng = documentMatch[1] === "image/png" && documentBuffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  if (!validPdf && !validJpeg && !validPng) return res.status(400).json({ message: "The uploaded trade license file is invalid." });
+  const supplier = await User.findOneAndUpdate({ _id: req.user.userId, role: "supplier", isActive: true, verificationStatus: { $nin: ["pending", "verified"] } }, { $set: { ...updates, verificationStatus: "pending", verificationNote: "", isVerified: false } }, { new: true, runValidators: true }).select("name email phone businessName businessType businessDescription address city contactPerson designation businessRegistrationType tradeLicenseNumber taxIdentificationNumber vatBinNumber website verificationStatus isVerified");
   if (!supplier) return res.status(409).json({ message: "A verification request is already pending, the supplier is already verified, or the account is unavailable." });
   return res.json({ message: "Verification request submitted.", supplier });
 });
 
 router.get("/admin/verification", authMiddleware, adminMiddleware, requirePermission("view_suppliers"), async (req, res) => {
-  const suppliers = await User.find({ role: "supplier", verificationStatus: "pending" }).select("name email phone businessName businessType businessDescription address city verificationStatus createdAt").sort({ updatedAt: -1 });
+  const suppliers = await User.find({ role: "supplier", verificationStatus: "pending" }).select("+tradeLicenseDocument name email phone businessName businessType businessDescription address city contactPerson designation businessRegistrationType tradeLicenseNumber taxIdentificationNumber vatBinNumber website verificationStatus createdAt").sort({ updatedAt: -1 });
   return res.json({ suppliers });
 });
 
@@ -231,6 +255,51 @@ router.patch("/admin/verification/:id", authMiddleware, adminMiddleware, require
   const supplier = await User.findOneAndUpdate({ _id: req.params.id, role: "supplier", verificationStatus: "pending" }, { $set: { verificationStatus: decision, isVerified: decision === "verified", verificationNote: note.trim() } }, { new: true }).select("name email businessName city verificationStatus verificationNote isVerified");
   if (!supplier) return res.status(404).json({ message: "Pending supplier request not found." });
   return res.json({ message: `Supplier ${decision} successfully.`, supplier });
+});
+
+// Buyer verification is private to the buyer and admin staff with user-review permissions.
+router.post("/buyer/verification", authMiddleware, requireRole("buyer"), async (req, res) => {
+  const required = ["name", "phone", "buyerType", "address", "city", "country", "governmentIdType", "governmentIdNumber", "governmentIdDocument"];
+  for (const field of required) if (typeof req.body[field] !== "string" || !req.body[field].trim()) return res.status(400).json({ message: `${field} is required.` });
+  if (!["individual", "business"].includes(req.body.buyerType)) return res.status(400).json({ message: "Choose an individual or business buyer profile." });
+  if (!["National ID", "Passport", "Driving License"].includes(req.body.governmentIdType)) return res.status(400).json({ message: "Choose a valid identity document type." });
+  if (!isValidPrivateDocument(req.body.governmentIdDocument)) return res.status(400).json({ message: "Upload a valid identity document as PDF, JPG or PNG (up to 900 KB)." });
+  const limits = { name: 150, phone: 40, address: 400, city: 100, country: 100, governmentIdNumber: 100, postalCode: 30, organizationName: 180, buyerDesignation: 120, businessRegistrationNumber: 120 };
+  for (const [field, max] of Object.entries(limits)) if (typeof req.body[field] === "string" && req.body[field].length > max) return res.status(400).json({ message: `${field} is too long.` });
+  const updates = Object.fromEntries(required.filter((field) => !["governmentIdDocument"].includes(field)).map((field) => [field, req.body[field].trim()]));
+  updates.governmentIdDocument = req.body.governmentIdDocument;
+  updates.postalCode = String(req.body.postalCode || "").trim();
+  updates.organizationName = String(req.body.organizationName || "").trim();
+  updates.buyerDesignation = String(req.body.buyerDesignation || "").trim();
+  updates.businessRegistrationNumber = String(req.body.businessRegistrationNumber || "").trim();
+  if (updates.buyerType === "business") {
+    if (!updates.organizationName || !updates.businessRegistrationNumber || !isValidPrivateDocument(req.body.buyerBusinessDocument)) return res.status(400).json({ message: "Business buyers must provide organization name, registration number and a trade license file (PDF, JPG or PNG, up to 900 KB)." });
+    updates.buyerBusinessDocument = req.body.buyerBusinessDocument;
+  } else {
+    updates.organizationName = "";
+    updates.businessRegistrationNumber = "";
+    updates.buyerBusinessDocument = "";
+  }
+  const buyer = await User.findOneAndUpdate({ _id: req.user.userId, role: "buyer", isActive: true, isVerified: { $ne: true }, verificationStatus: { $nin: ["pending", "verified"] } }, { $set: { ...updates, verificationStatus: "pending", verificationNote: "", isVerified: false } }, { new: true, runValidators: true }).select("name email phone buyerType organizationName buyerDesignation address city postalCode country governmentIdType governmentIdNumber businessRegistrationNumber verificationStatus verificationNote isVerified");
+  if (!buyer) return res.status(409).json({ message: "A buyer verification request is already pending, this account is verified, or the account is unavailable." });
+  return res.json({ message: "Buyer verification request submitted for admin review.", buyer });
+});
+
+router.get("/admin/buyer-verification", authMiddleware, adminMiddleware, requirePermission("view_users"), async (req, res) => {
+  const buyers = await User.find({ role: "buyer", verificationStatus: "pending" })
+    .select("+governmentIdDocument +buyerBusinessDocument name email phone buyerType organizationName buyerDesignation address city postalCode country governmentIdType governmentIdNumber businessRegistrationNumber verificationStatus createdAt")
+    .sort({ updatedAt: -1 });
+  return res.json({ buyers });
+});
+
+router.patch("/admin/buyer-verification/:id", authMiddleware, adminMiddleware, requirePermission("manage_users"), async (req, res) => {
+  const { decision, note = "" } = req.body;
+  if (!validId(req.params.id)) return res.status(400).json({ message: "Invalid buyer ID." });
+  if (!["verified", "rejected"].includes(decision)) return res.status(400).json({ message: "Decision must be verified or rejected." });
+  if (typeof note !== "string" || note.length > 500) return res.status(400).json({ message: "Note must be text up to 500 characters." });
+  const buyer = await User.findOneAndUpdate({ _id: req.params.id, role: "buyer", verificationStatus: "pending" }, { $set: { verificationStatus: decision, isVerified: decision === "verified", verificationNote: note.trim() } }, { new: true }).select("name email verificationStatus verificationNote isVerified");
+  if (!buyer) return res.status(404).json({ message: "Pending buyer verification request not found." });
+  return res.json({ message: `Buyer ${decision} successfully.`, buyer });
 });
 
 module.exports = router;

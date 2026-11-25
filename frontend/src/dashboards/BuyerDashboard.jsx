@@ -19,6 +19,9 @@ function BuyerDashboard({ user, onLogout, logoData }) {
   const [activeTab, setActiveTab] = useState("products");
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
+  const [expandedOrderId, setExpandedOrderId] = useState(null);
+  const [showVerificationSuccess, setShowVerificationSuccess] = useState(false);
+  const [verificationForm, setVerificationForm] = useState({ name: "", phone: "", buyerType: "individual", organizationName: "", buyerDesignation: "", businessRegistrationNumber: "", address: "", city: "", postalCode: "", country: "Bangladesh", governmentIdType: "National ID", governmentIdNumber: "", governmentIdDocument: "", buyerBusinessDocument: "" });
 
   const token = localStorage.getItem("token");
 
@@ -73,7 +76,9 @@ function BuyerDashboard({ user, onLogout, logoData }) {
 
       if (results[2].status === "fulfilled") {
         const data = results[2].value;
-        setProfile(data.buyer || data.user || data.profile || data);
+        const buyer = data.buyer || data.user || data.profile || data;
+        setProfile(buyer);
+        setVerificationForm((previous) => ({ ...previous, ...Object.fromEntries(Object.keys(previous).filter((key) => !["governmentIdDocument", "buyerBusinessDocument"].includes(key)).map((key) => [key, buyer[key] || (key === "name" ? buyer.name : "") || (key === "phone" ? buyer.phone : "") || ""])) }));
       }
       if (results[3].status === "fulfilled") setFavorites(results[3].value.favorites || []);
       if (results[4].status === "fulfilled") setInquiries(results[4].value.inquiries || []);
@@ -111,6 +116,12 @@ function BuyerDashboard({ user, onLogout, logoData }) {
       return;
     }
 
+    const shippingAddress = window.prompt("Enter the full delivery address for this order:", profile?.address || "");
+    if (!shippingAddress?.trim()) {
+      setMessage("A delivery address is required to place an order.");
+      return;
+    }
+
     try {
       setMessage("");
 
@@ -120,6 +131,7 @@ await request("/orders", {
   body: JSON.stringify({
     productId: product._id,
     quantity,
+    shippingAddress: shippingAddress.trim(),
   }),
 });
 
@@ -161,6 +173,32 @@ await request("/orders", {
   });
 
   const isFavorite = (productId) => favorites.some((row) => String(row.product?._id || row.product) === String(productId));
+
+  const handleVerificationChange = (event) => setVerificationForm((previous) => ({ ...previous, [event.target.name]: event.target.value }));
+
+  const handleVerificationFile = async (event, field) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (!["application/pdf", "image/jpeg", "image/png"].includes(file.type)) { setMessage("Choose a PDF, JPG or PNG document."); event.target.value = ""; return; }
+    if (file.size > 900_000) { setMessage("Each verification document must be smaller than 900 KB."); event.target.value = ""; return; }
+    try {
+      const dataUrl = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => reject(new Error("Could not read this document.")); reader.readAsDataURL(file); });
+      setVerificationForm((previous) => ({ ...previous, [field]: dataUrl }));
+      setMessage("");
+    } catch (error) { setMessage(error.message); }
+    event.target.value = "";
+  };
+
+  const submitBuyerVerification = async (event) => {
+    event.preventDefault();
+    if (verificationForm.buyerType === "business" && !verificationForm.buyerBusinessDocument) { setMessage("Add the business trade license before submitting."); return; }
+    try {
+      setMessage("");
+      await request("/sourcing/buyer/verification", { method: "POST", body: JSON.stringify(verificationForm) });
+      await loadDashboard();
+      setShowVerificationSuccess(true);
+    } catch (error) { setMessage(error.message || "Could not submit buyer verification."); }
+  };
 
   const toggleFavorite = async (product) => {
     try {
@@ -241,6 +279,7 @@ await request("/orders", {
       <section className="dashboard-welcome">
         <h2>
           Welcome, {profile?.name || user?.name || "Buyer"}!
+          {profile?.isVerified && <span className="buyer-verified-badge">✓ Verified buyer</span>}
         </h2>
         <p>Discover products and manage your orders in one place.</p>
       </section>
@@ -359,7 +398,7 @@ await request("/orders", {
                     <p>Rating: {product.averageRating || "No ratings"} ({product.reviewCount || 0} reviews)</p>
 
                     <div className="sourcing-actions">
-                      <button className="dashboard-secondary-button" onClick={() => toggleFavorite(product)}>{isFavorite(product._id) ? "♥ Saved" : "♡ Save"}</button>
+                      <button className={`buyer-save-button ${isFavorite(product._id) ? "saved" : ""}`} onClick={() => toggleFavorite(product)}>{isFavorite(product._id) ? "♥ Saved" : "♡ Save"}</button>
                       <button className="dashboard-secondary-button" onClick={() => toggleCompare(product._id)}>{compareIds.includes(product._id) ? "Remove Compare" : "Compare"}</button>
                       <button className="dashboard-secondary-button" onClick={() => sendInquiry(product)}>Ask Supplier / RFQ</button>
                       <button className="dashboard-secondary-button" onClick={() => showReviews(product._id)}>View Reviews</button>
@@ -384,84 +423,35 @@ await request("/orders", {
         </section>
       )}
 
-      {activeTab === "favorites" && <section className="dashboard-section"><h2>Saved Products</h2>{favorites.length ? <div className="dashboard-product-grid">{favorites.map((row) => row.product && <article className="dashboard-product" key={row._id}><div className="dashboard-product-content"><h3>{row.product.name}</h3><p>{row.product.category} · {row.product.supplier?.city || "Location not provided"}</p><strong>{row.product.currency} {Number(row.product.price).toLocaleString()} / {row.product.unit}</strong><button className="dashboard-cancel-button" onClick={() => toggleFavorite(row.product)}>Remove</button></div></article>)}</div> : <p className="dashboard-empty">No saved products yet.</p>}</section>}
+      {activeTab === "favorites" && <section className="dashboard-section buyer-favorites-section"><div className="buyer-section-heading"><div><span className="buyer-section-eyebrow">YOUR SHORTLIST</span><h2>Favorite products</h2><p>Keep the supplier listings you want to come back to.</p></div><span className="buyer-favorite-count">♥ {favorites.length} saved</span></div>{favorites.length ? <div className="buyer-favorite-grid">{favorites.map((row) => row.product && <article className="buyer-favorite-card" key={row._id}><div className="buyer-favorite-image">{row.product.images?.[0] ? <img src={row.product.images[0]} alt={row.product.name} /> : <span>{row.product.name?.slice(0, 1)?.toUpperCase() || "P"}</span>}<button aria-label={`Remove ${row.product.name} from favorites`} onClick={() => toggleFavorite(row.product)}>♥</button></div><div className="buyer-favorite-content"><span className="buyer-favorite-category">{row.product.category || "Product"}</span><h3>{row.product.name}</h3><p className="buyer-favorite-supplier">{row.product.supplier?.businessName || row.product.supplier?.name || "SourceBD supplier"} {row.product.supplier?.isVerified && <span className="buyer-verified-mini">✓ Verified</span>}</p><p className="buyer-favorite-location">⌖ {row.product.supplier?.city || "Location not provided"}</p><div className="buyer-favorite-price"><strong>{row.product.currency || "BDT"} {Number(row.product.price || 0).toLocaleString()}</strong><span>/ {row.product.unit || "unit"}</span></div><div className="buyer-favorite-actions"><button className="dashboard-primary-button" onClick={() => placeOrder(row.product)} disabled={Number(row.product.quantity) <= 0}>{Number(row.product.quantity) > 0 ? "Order this product" : "Out of stock"}</button><button className="buyer-remove-favorite" onClick={() => toggleFavorite(row.product)}>Remove from favorites</button></div></div></article>)}</div> : <div className="buyer-favorites-empty"><span>♡</span><h3>Your favorites will appear here</h3><p>Save a product from the Products tab to keep it handy.</p><button onClick={() => setActiveTab("products")}>Explore products</button></div>}</section>}
 
       {activeTab === "compare" && <section className="dashboard-section"><h2>Compare Suppliers</h2>{compareIds.length < 2 ? <p className="dashboard-empty">Select at least two products from Products to compare.</p> : <div className="dashboard-table-wrapper"><table className="dashboard-table"><thead><tr><th>Product</th><th>Supplier</th><th>Location</th><th>Price</th><th>MOQ</th><th>Rating</th><th>Verified</th></tr></thead><tbody>{products.filter((item) => compareIds.includes(item._id)).map((item) => <tr key={item._id}><td>{item.name}</td><td>{item.supplier?.businessName || item.supplier?.name || "—"}</td><td>{item.supplier?.city || "—"}</td><td>{item.currency} {item.price} / {item.unit}</td><td>{item.minimumOrderQuantity}</td><td>{item.averageRating || "—"} ({item.reviewCount || 0})</td><td>{item.supplier?.isVerified ? "Verified" : "No"}</td></tr>)}</tbody></table></div>}</section>}
 
       {activeTab === "inquiries" && <section className="dashboard-section"><h2>My Supplier Inquiries</h2>{inquiries.length ? inquiries.map((item) => <article className="dashboard-panel" key={item._id}><h3>{item.productName}</h3><p><strong>Supplier:</strong> {item.supplier?.businessName || item.supplier?.name || "—"}</p><p>{item.details}</p><p>Status: {item.status}</p>{item.supplierResponse && <p><strong>Supplier response:</strong> {item.supplierResponse}</p>}</article>) : <p className="dashboard-empty">No inquiries sent yet.</p>}</section>}
 
       {activeTab === "orders" && (
-        <section className="dashboard-section">
-          <h2>My Orders</h2>
-
-          {orders.length === 0 ? (
-            <p className="dashboard-empty">You have not placed any orders yet.</p>
-          ) : (
-            <div className="dashboard-table-wrapper">
-              <table className="dashboard-table">
-                <thead>
-                  <tr>
-                    <th>Order ID</th>
-                    <th>Status</th>
-                    <th>Total</th>
-                    <th>Action</th>
-                  </tr>
-                </thead>
-
-                <tbody>
-                  {orders.map((order) => (
-                    <tr key={order._id}>
-                      <td>{order._id}</td>
-                      <td>
-                        <span className="dashboard-status">
-                          {order.status}
-                        </span>
-                      </td>
-                      <td>
-                        {order.currency || "BDT"}{" "}
-                        {Number(order.totalAmount || order.total || 0).toLocaleString()}
-                      </td>
-                      <td>
-                        {order.status === "pending" && (
-                          <button
-                            className="dashboard-cancel-button"
-                            onClick={() => cancelOrder(order._id)}
-                          >
-                            Cancel
-                          </button>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+        <section className="dashboard-section buyer-orders-section">
+          <div className="buyer-section-heading"><div><span className="buyer-section-eyebrow">ORDER TRACKING</span><h2>My Orders</h2><p>Review your items, suppliers, totals and delivery addresses.</p></div><span className="buyer-order-count">{orders.length} {orders.length === 1 ? "order" : "orders"}</span></div>
+          {orders.length === 0 ? <div className="buyer-orders-empty"><span>▤</span><h3>No orders yet</h3><p>When you place an order, its supplier and delivery details will appear here.</p><button onClick={() => setActiveTab("products")}>Browse products</button></div> : <div className="buyer-order-list">{orders.map((order) => {
+            const supplier = order.supplier || {};
+            const product = order.product || {};
+            const total = Number(order.totalPrice ?? order.totalAmount ?? order.total ?? 0);
+            const isExpanded = expandedOrderId === order._id;
+            return <article className={`buyer-order-card ${isExpanded ? "expanded" : ""}`} key={order._id}>
+              <div className="buyer-order-card-head"><div><span>ORDER #{String(order._id).slice(-8).toUpperCase()}</span><small>Placed {new Date(order.createdAt).toLocaleDateString("en-BD", { year: "numeric", month: "short", day: "numeric" })}</small></div><span className={`buyer-order-status status-${order.status}`}>{order.status}</span></div>
+              <div className="buyer-order-summary"><div className="buyer-order-product-image">{product.images?.[0] ? <img src={product.images[0]} alt={order.productName || product.name || "Ordered product"} /> : <span>{(order.productName || product.name || "P").slice(0, 1).toUpperCase()}</span>}</div><div className="buyer-order-product-info"><span>{product.category || "Product"}</span><h3>{order.productName || product.name || "Product listing"}</h3><p>Quantity: <strong>{Number(order.quantity || 0).toLocaleString()} {product.unit || "unit(s)"}</strong></p><p>Supplier: <strong>{supplier.businessName || supplier.name || "Supplier"}</strong> {supplier.isVerified && <span className="buyer-verified-mini">✓ Verified</span>}</p></div><div className="buyer-order-total"><small>Order total</small><strong>{order.currency || "BDT"} {total.toLocaleString("en-BD", { maximumFractionDigits: 2 })}</strong><small>{order.currency || "BDT"} {Number(order.unitPrice || 0).toLocaleString("en-BD", { maximumFractionDigits: 2 })} × {Number(order.quantity || 0).toLocaleString()}</small></div></div>
+              <div className="buyer-order-card-actions"><button className="buyer-order-details-button" aria-expanded={isExpanded} onClick={() => setExpandedOrderId(isExpanded ? null : order._id)}>{isExpanded ? "Hide order details" : "View order details"}<span>{isExpanded ? "⌃" : "⌄"}</span></button>{order.status === "pending" && <button className="buyer-order-cancel" onClick={() => cancelOrder(order._id)}>Cancel order</button>}</div>
+              {isExpanded && <div className="buyer-order-detail-grid"><section className="buyer-order-detail-panel"><span>ITEM DETAILS</span><h4>{order.productName || product.name || "Product listing"}</h4><p>{product.description || "Product description unavailable."}</p><dl><div><dt>Category</dt><dd>{product.category || "—"}</dd></div><div><dt>Quantity</dt><dd>{Number(order.quantity || 0).toLocaleString()} {product.unit || "unit(s)"}</dd></div><div><dt>Price per unit</dt><dd>{order.currency || "BDT"} {Number(order.unitPrice || 0).toLocaleString()}</dd></div><div><dt>Order total</dt><dd>{order.currency || "BDT"} {total.toLocaleString()}</dd></div></dl>{order.note && <p><strong>Your note:</strong> {order.note}</p>}</section><section className="buyer-order-detail-panel"><span>SUPPLIER & DELIVERY</span><h4>{supplier.businessName || supplier.name || "Supplier"} {supplier.isVerified && <span className="buyer-verified-mini">✓ Verified</span>}</h4>{supplier.businessName && <p>Contact: {supplier.name || "—"}</p>}<p><strong>Phone:</strong> {supplier.phone ? <a href={`tel:${supplier.phone}`}>{supplier.phone}</a> : "Not provided"}</p><p><strong>Email:</strong> {supplier.email ? <a href={`mailto:${supplier.email}`}>{supplier.email}</a> : "Not provided"}</p><p><strong>Supplier location:</strong> {[supplier.address, supplier.city].filter(Boolean).join(", ") || "Not provided"}</p><div className="buyer-delivery-address"><small>DELIVERY ADDRESS</small><p>{order.shippingAddress || "No delivery address was saved for this order."}</p></div></section></div>}
+            </article>;
+          })}</div>}
         </section>
       )}
 
       {activeTab === "profile" && (
-        <section className="dashboard-section">
-          <h2>My Profile</h2>
-
-          <div className="dashboard-profile">
-            <p>
-              <strong>Name:</strong>{" "}
-              {profile?.name || user?.name || "Not available"}
-            </p>
-            <p>
-              <strong>Email:</strong>{" "}
-              {profile?.email || user?.email || "Not available"}
-            </p>
-            <p>
-              <strong>Phone:</strong> {profile?.phone || "Not provided"}
-            </p>
-            <p>
-              <strong>Role:</strong> {profile?.role || user?.role || "buyer"}
-            </p>
-          </div>
+        <section className="dashboard-section buyer-profile-section"><div className="buyer-section-heading"><div><span className="buyer-section-eyebrow">ACCOUNT & IDENTITY</span><h2>My Profile</h2><p>Manage your contact details and submit your buyer identity for review.</p></div><span className={`buyer-verification-status ${profile?.verificationStatus || "not_submitted"}`}>{profile?.isVerified ? "✓ Verified buyer" : profile?.verificationStatus === "pending" ? "Under review" : profile?.verificationStatus === "rejected" ? "Update requested" : "Not verified"}</span></div><div className="buyer-profile-summary"><div className="buyer-profile-avatar">{(profile?.name || user?.name || "B").slice(0, 1).toUpperCase()}</div><div><h3>{profile?.name || user?.name || "Buyer"}{profile?.isVerified && <span className="buyer-verified-badge">✓ Verified buyer</span>}</h3><p>{profile?.email || user?.email || ""}</p><small>Buyer account · SourceBD</small></div></div>{profile?.verificationNote && <div className="buyer-admin-note"><strong>Admin feedback:</strong> {profile.verificationNote}</div>}{profile?.verificationStatus === "verified" ? <div className="buyer-verification-callout success"><span>✓</span><div><strong>Your buyer profile is verified</strong><p>Suppliers can see your verified status when reviewing your orders.</p></div></div> : profile?.verificationStatus === "pending" ? <div className="buyer-verification-callout pending"><span>◷</span><div><strong>Your request is under admin review</strong><p>We will review the contact information and identity documents you submitted.</p></div></div> : <form className="buyer-verification-form" onSubmit={submitBuyerVerification}><div className="buyer-form-section-title"><span>01</span><div><h3>Contact and delivery details</h3><p>Use the details suppliers need to confirm and deliver your orders.</p></div></div><div className="buyer-verification-grid"><label>Full name *<input name="name" value={verificationForm.name} onChange={handleVerificationChange} maxLength="150" required /></label><label>Account email<input value={profile?.email || user?.email || ""} readOnly /></label><label>Phone number *<input name="phone" type="tel" value={verificationForm.phone} onChange={handleVerificationChange} maxLength="40" required /></label><label>Buyer profile type *<select name="buyerType" value={verificationForm.buyerType} onChange={handleVerificationChange}><option value="individual">Individual buyer</option><option value="business">Business buyer</option></select></label>{verificationForm.buyerType === "business" && <><label>Business / organization name *<input name="organizationName" value={verificationForm.organizationName} onChange={handleVerificationChange} maxLength="180" required /></label><label>Job title / designation<input name="buyerDesignation" value={verificationForm.buyerDesignation} onChange={handleVerificationChange} maxLength="120" placeholder="e.g. Procurement Manager" /></label></>}<label>City / district *<input name="city" value={verificationForm.city} onChange={handleVerificationChange} maxLength="100" required /></label><label>Postal code<input name="postalCode" value={verificationForm.postalCode} onChange={handleVerificationChange} maxLength="30" /></label><label className="buyer-address-field">Full address *<textarea name="address" value={verificationForm.address} onChange={handleVerificationChange} rows="3" maxLength="400" required /></label><label>Country *<input name="country" value={verificationForm.country} onChange={handleVerificationChange} maxLength="100" required /></label></div><div className="buyer-form-section-title"><span>02</span><div><h3>Identity verification</h3><p>Your documents are available only to authorized admins reviewing this request.</p></div></div><div className="buyer-verification-grid"><label>ID document type *<select name="governmentIdType" value={verificationForm.governmentIdType} onChange={handleVerificationChange}><option>National ID</option><option>Passport</option><option>Driving License</option></select></label><label>ID / passport number *<input name="governmentIdNumber" value={verificationForm.governmentIdNumber} onChange={handleVerificationChange} maxLength="100" required /></label><label className="buyer-document-upload">Upload identity document *<input type="file" accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png" onChange={(event) => handleVerificationFile(event, "governmentIdDocument")} required={!verificationForm.governmentIdDocument} /><small>{verificationForm.governmentIdDocument ? "Identity document attached" : "PDF, JPG or PNG · up to 900 KB"}</small></label>{verificationForm.buyerType === "business" && <><label>Business registration number *<input name="businessRegistrationNumber" value={verificationForm.businessRegistrationNumber} onChange={handleVerificationChange} maxLength="120" required /></label><label className="buyer-document-upload">Upload trade license *<input type="file" accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png" onChange={(event) => handleVerificationFile(event, "buyerBusinessDocument")} required={!verificationForm.buyerBusinessDocument} /><small>{verificationForm.buyerBusinessDocument ? "Business license attached" : "PDF, JPG or PNG · up to 900 KB"}</small></label></>}</div><div className="buyer-verification-footer"><p>Submitting sends your information and document(s) to the admin team for review.</p><button className="dashboard-primary-button" type="submit">Submit for verification</button></div></form>}
         </section>
       )}
+      {showVerificationSuccess && <div className="buyer-verification-overlay" role="presentation"><section className="buyer-verification-modal" role="dialog" aria-modal="true" aria-labelledby="buyer-verification-title"><span>✓</span><h2 id="buyer-verification-title">Request submitted</h2><p>Your buyer verification request is now with the admin team. We’ll update your profile when it has been reviewed.</p><button className="dashboard-primary-button" onClick={() => setShowVerificationSuccess(false)}>Okay</button></section></div>}
     </main>
   );
 }

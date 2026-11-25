@@ -19,7 +19,9 @@ function Register({ onBack }) {
   const [showPassword, setShowPassword] = useState(false);
 
   const handleChange = (event) => {
-    setForm((previous) => ({ ...previous, [event.target.name]: event.target.value }));
+    const { name, value } = event.target;
+    const nextValue = name === "phone" ? value.replace(/(?!^\+)\D/g, "").slice(0, 14) : value;
+    setForm((previous) => ({ ...previous, [name]: nextValue }));
   };
 
   const sendCode = async (event) => {
@@ -27,6 +29,10 @@ function Register({ onBack }) {
     setMessage("");
     if (form.password.length < 8) {
       setMessage("Password must be at least 8 characters.");
+      return;
+    }
+    if (!/^(?:01[3-9]\d{8}|\+?8801[3-9]\d{8})$/.test(form.phone.replace(/[\s()-]/g, ""))) {
+      setMessage("Enter a valid Bangladesh mobile number: 11 digits starting with 01, or +8801 followed by 9 digits.");
       return;
     }
 
@@ -84,7 +90,9 @@ function Register({ onBack }) {
   return (
     <div className="register-page">
       <form className="register-form" onSubmit={step === "details" ? sendCode : createAccount}>
-        <h2>{step === "verification" ? "Verify Your Contact" : step === "complete" ? "Account Created" : "Create Your SourceBD Account"}</h2>
+        <div className="auth-brand"><span className="auth-brand-mark">S</span><span>Source<span>BD</span></span></div>
+        <span className="auth-kicker">BANGLADESH WHOLESALE SOURCING</span>
+        <h2>{step === "verification" ? "Verify Your Email" : step === "complete" ? "Account Created" : "Create your account"}</h2>
         <p>{step === "verification" ? `Enter the code sent to ${maskedDestination}.` : "Join Bangladesh's business sourcing community."}</p>
 
         {step === "details" && <>
@@ -95,17 +103,14 @@ function Register({ onBack }) {
           <input id="email" name="email" type="email" value={form.email} onChange={handleChange} placeholder="Enter your email" autoComplete="email" required />
 
           <label htmlFor="phone">Phone Number</label>
-          <input id="phone" name="phone" type="tel" value={form.phone} onChange={handleChange} placeholder="01XXXXXXXXX or +8801XXXXXXXXX" autoComplete="tel" required />
+          <input id="phone" name="phone" type="tel" inputMode="tel" value={form.phone} onChange={handleChange} placeholder="01XXXXXXXXX or +8801XXXXXXXXX" autoComplete="tel" pattern="(?:01[3-9][0-9]{8}|\+?8801[3-9][0-9]{8})" title="Use an 11-digit Bangladesh number beginning with 01, or +8801 followed by 9 digits." maxLength={14} required />
+          <small className="auth-field-hint">Bangladesh mobile number · 11 digits</small>
 
-          <label htmlFor="verificationMethod">Verify using</label>
-          <select id="verificationMethod" name="verificationMethod" value={form.verificationMethod} onChange={handleChange}>
-            <option value="email">Email</option>
-            <option value="phone">Phone number (SMS)</option>
-          </select>
+          <div className="auth-email-verification"><span className="auth-email-icon">✉</span><span><strong>Verify using email</strong><small>We’ll send your one-time code to your email address.</small></span><span className="auth-only-badge">EMAIL</span></div>
 
           <label htmlFor="password">Password</label>
           <div className="password-input-wrapper">
-            <input id="password" name="password" type={showPassword ? "text" : "password"} value={form.password} onChange={handleChange} placeholder="Minimum 8 characters" minLength={8} autoComplete="new-password" required />
+            <input id="password" name="password" type={showPassword ? "text" : "password"} value={form.password} onChange={handleChange} placeholder="At least 8 characters" minLength={8} autoComplete="new-password" required />
             <button type="button" className="password-toggle" onClick={() => setShowPassword((shown) => !shown)} aria-label={showPassword ? "Hide password" : "Show password"}>
               {showPassword ? "🙈" : "👁️"}
             </button>
@@ -120,7 +125,7 @@ function Register({ onBack }) {
         </>}
 
         {step === "verification" && <>
-          <label htmlFor="verificationCode">6-digit verification code</label>
+          <label htmlFor="verificationCode">6-digit email verification code</label>
           <input id="verificationCode" name="verificationCode" type="text" inputMode="numeric" autoComplete="one-time-code" maxLength={6} pattern="[0-9]{6}" value={verificationCode} onChange={(event) => setVerificationCode(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="Enter code" required />
           <button type="submit" disabled={loading}>{loading ? "Verifying..." : "Verify & Create Account"}</button>
           <button type="button" onClick={sendCode} disabled={loading}>Resend Code</button>

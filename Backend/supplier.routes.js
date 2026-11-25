@@ -1,6 +1,9 @@
 
 const express = require("express");
 const mongoose = require("mongoose");
+const fs = require("fs/promises");
+const path = require("path");
+const crypto = require("crypto");
 const router = express.Router();
 
 const User = require("./user.model");
@@ -59,7 +62,7 @@ router.get("/profile", async (req, res) => {
       _id: req.user.userId,
       role: "supplier",
       isActive: true,
-    }).select("_id name email role phone isVerified verificationStatus verificationNote businessName businessType businessDescription address city createdAt");
+    }).select("_id name email role phone isVerified verificationStatus verificationNote businessName businessType businessDescription address city contactPerson designation businessRegistrationType tradeLicenseNumber taxIdentificationNumber vatBinNumber website createdAt");
 
     if (!supplier) {
       return res.status(404).json({
@@ -86,7 +89,7 @@ router.get("/profile", async (req, res) => {
 // ========================================
 router.patch("/profile", async (req, res) => {
   try {
-    const { name, phone, businessName, businessType, businessDescription, address, city } = req.body;
+    const { name, phone, businessName, businessType, businessDescription, address, city, contactPerson, designation, businessRegistrationType, tradeLicenseNumber, taxIdentificationNumber, vatBinNumber, website } = req.body;
 
     const updates = {};
 
@@ -110,7 +113,7 @@ router.patch("/profile", async (req, res) => {
       updates.phone = phone.trim();
     }
 
-    for (const [field, value] of Object.entries({ businessName, businessType, businessDescription, address, city })) {
+    for (const [field, value] of Object.entries({ businessName, businessType, businessDescription, address, city, contactPerson, designation, businessRegistrationType, tradeLicenseNumber, taxIdentificationNumber, vatBinNumber, website })) {
       if (value !== undefined) {
         if (typeof value !== "string" || value.length > 1000) {
           return res.status(400).json({ message: `${field} must be text up to 1000 characters.` });
@@ -136,7 +139,7 @@ router.patch("/profile", async (req, res) => {
         new: true,
         runValidators: true,
       }
-    ).select("_id name email role phone isVerified verificationStatus verificationNote businessName businessType businessDescription address city createdAt");
+    ).select("_id name email role phone isVerified verificationStatus verificationNote businessName businessType businessDescription address city contactPerson designation businessRegistrationType tradeLicenseNumber taxIdentificationNumber vatBinNumber website createdAt");
 
     if (!supplier) {
       return res.status(404).json({
@@ -161,6 +164,28 @@ router.patch("/profile", async (req, res) => {
 // CREATE PRODUCT LISTING
 // POST /api/supplier/products
 // ========================================
+router.post("/products/image", async (req, res) => {
+  try {
+    const { imageData } = req.body;
+    const match = typeof imageData === "string" && imageData.match(/^data:image\/(jpeg|png);base64,([A-Za-z0-9+/=]+)$/);
+    if (!match) return res.status(400).json({ message: "Choose a valid JPG or PNG product image." });
+    const buffer = Buffer.from(match[2], "base64");
+    if (!buffer.length || buffer.length > 1_500_000) return res.status(400).json({ message: "Product image must be smaller than 1.5 MB after compression." });
+    const isJpeg = match[1] === "jpeg" && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+    const isPng = match[1] === "png" && buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+    if (!isJpeg && !isPng) return res.status(400).json({ message: "The uploaded image file is invalid." });
+    const extension = isPng ? "png" : "jpg";
+    const fileName = `${req.user.userId}-${crypto.randomUUID()}.${extension}`;
+    const directory = path.join(__dirname, "uploads", "products");
+    await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(path.join(directory, fileName), buffer, { flag: "wx" });
+    return res.status(201).json({ imageUrl: `${req.protocol}://${req.get("host")}/uploads/products/${fileName}` });
+  } catch (error) {
+    console.error("Product image upload error:", error.message);
+    return res.status(500).json({ message: "Could not save the product image." });
+  }
+});
+
 router.post("/products", async (req, res) => {
   try {
     const {
